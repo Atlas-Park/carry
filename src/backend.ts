@@ -2,6 +2,25 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import { ensureAnonymousSession, supabase } from "./supabase";
 import type { Room, RoomRecord } from "./App";
 
+export async function roomCommand(
+  id: string,
+  action: string,
+  payload: Record<string, unknown> = {},
+) {
+  if (!supabase) throw new Error("서버 연결을 확인해주세요.");
+  const { data, error } = await supabase.rpc("carry_command", {
+    p_room_id: id,
+    p_action: action,
+    p_payload: payload,
+  });
+  if (error) throw new Error(error.message);
+  const record = data as RoomRecord | null;
+  window.dispatchEvent(
+    new CustomEvent("carry-remote", { detail: { id, record } }),
+  );
+  return record;
+}
+
 type RpcResult = {
   room_id: string;
   member_id: string;

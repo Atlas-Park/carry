@@ -17,7 +17,16 @@ export const supabase = isSupabaseConfigured
     })
   : null;
 
-export async function ensureAnonymousSession() {
+let pendingSession: ReturnType<typeof getOrCreateSession> | null = null;
+export function ensureAnonymousSession() {
+  if (!pendingSession)
+    pendingSession = getOrCreateSession().finally(() => {
+      pendingSession = null;
+    });
+  return pendingSession;
+}
+
+async function getOrCreateSession() {
   if (!supabase) return null;
 
   const {

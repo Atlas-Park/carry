@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
+import { SortableList } from "./SortableList";
 import {
   ArrowDown,
   ArrowLeft,
@@ -26,9 +27,9 @@ import {
 } from "./assignment";
 import {
   createRemoteRoom,
+  roomCommand,
   joinRemoteRoom,
   loadRemoteRecords,
-  saveRemoteRecord,
   subscribeToRoomSnapshots,
 } from "./backend";
 import {
@@ -75,6 +76,13 @@ export type Room = {
   leaderId?: string;
   completedAt?: string;
   hidden?: boolean;
+  startedAt?: string;
+  decision?: {
+    mode?: "known" | "random";
+    candidate?: string;
+    version?: string;
+    consents?: string[];
+  };
 };
 export type RoomRecord = {
   room: Room;
@@ -131,7 +139,7 @@ const MOCK_ROOM: Room = {
   members: mockMembers,
 };
 const demoNames = ["민지", "서준", "지우", "하린", "도윤", "수아"];
-const DEV = import.meta.env.DEV;
+const DEV = false;
 const emptyStore = (): CarryStore => ({
   version: 2,
   rooms: {},
@@ -310,13 +318,15 @@ const shuffled = <T,>(items: T[]) => {
 };
 export function App() {
   const applyingRemote = useRef(false);
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const currentRoomIdRef = useRef<string | null>(null);
   const initial = useRef(loadStore()).current,
     rawInitialRecord = initial.currentRoomId
       ? initial.rooms[initial.currentRoomId]
       : null,
-    initialRecord = rawInitialRecord ? hydrateViewer(rawInitialRecord) : null;
+    initialRecord =
+      !isSupabaseConfigured && rawInitialRecord
+        ? hydrateViewer(rawInitialRecord)
+        : null;
   const [screen, setScreen] = useState<Screen>("home"),
     [records, setRecords] = useState<Record<string, RoomRecord>>(initial.rooms),
     [currentRoomId, setCurrentRoomId] = useState<string | null>(
@@ -346,11 +356,28 @@ export function App() {
         setRoom(next.room);
         setResult(next.result);
         setAssignments(next.assignments);
-        if (["lobby", "results", "progress", "complete"].includes(next.screen))
-          setScreen(next.screen);
+        setScreen((current) =>
+          ["home", "create", "join"].includes(current) ? current : next.screen,
+        );
       }
     };
-    void (async () => {
+    const onRemote = (event: Event) => {
+      const { id, record } = (
+        event as CustomEvent<{ id: string; record: RoomRecord | null }>
+      ).detail;
+      if (record) applyRemoteRecord(id, record);
+      else
+        setRecords((previous) => {
+          const next = { ...previous };
+          delete next[id];
+          return next;
+        });
+    };
+    window.addEventListener("carry-remote", onRemote);
+    let refreshing = false;
+    const refresh = async () => {
+      if (refreshing || !alive) return;
+      refreshing = true;
       try {
         await ensureAnonymousSession();
         const remoteRooms = await loadRemoteRecords();
@@ -361,15 +388,36 @@ export function App() {
           const migrated = migrateRecord(item.record);
           if (migrated) loaded[item.roomId] = migrated;
         }
-        setRecords((local) => ({ ...local, ...loaded }));
-        channel = subscribeToRoomSnapshots(applyRemoteRecord);
+        setRecords(loaded);
+        const activeId = currentRoomIdRef.current;
+        if (activeId && loaded[activeId])
+          applyRemoteRecord(activeId, loaded[activeId]);
+        else if (activeId) {
+          setRoom(null);
+          setCurrentRoomId(null);
+          setScreen((current) =>
+            ["create", "join"].includes(current) ? current : "home",
+          );
+        }
+        if (!channel) channel = subscribeToRoomSnapshots(applyRemoteRecord);
       } catch (error) {
         console.error("Supabase startup failed", error);
         setToast("서버 연결을 확인해주세요");
+      } finally {
+        refreshing = false;
       }
-    })();
+    };
+    void refresh();
+    const onFocus = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    window.addEventListener("focus", onFocus);
+    const poll = setInterval(onFocus, 15000);
     return () => {
       alive = false;
+      clearInterval(poll);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("carry-remote", onRemote);
       if (channel && supabase) void supabase.removeChannel(channel);
     };
   }, []);
@@ -406,19 +454,12 @@ export function App() {
         "carry-store",
         JSON.stringify({ version: 2, rooms: next, currentRoomId }),
       );
-      if (!skipRemoteSave && isSupabaseConfigured) {
-        if (saveTimer.current) clearTimeout(saveTimer.current);
-        saveTimer.current = setTimeout(() => {
-          void saveRemoteRecord(record).catch((error) => {
-            console.error("Supabase save failed", error);
-            setToast("변경 내용을 서버에 저장하지 못했어요");
-          });
-        }, 300);
-      }
+
       return next;
     });
   }, [room, result, assignments, screen, currentRoomId]);
   useEffect(() => {
+    if (isSupabaseConfigured) return;
     const sync = (e: StorageEvent) => {
       if (e.key !== "carry-store" || !e.newValue) return;
       try {
@@ -462,40 +503,77 @@ export function App() {
           : record.screen,
     );
   };
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const run = async (action: string, payload: Record<string, unknown> = {}) => {
+    if (!room || busyRef.current) return false;
+    busyRef.current = true;
+    setBusy(true);
+    setToast("");
+    try {
+      await roomCommand(room.id, action, payload);
+      return true;
+    } catch (e) {
+      setToast(
+        e instanceof Error
+          ? e.message
+          : "저장하지 못했어요. 다시 시도해주세요.",
+      );
+      return false;
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  };
+  const changeRoom = (next: Room) => {
+    if (!room) return Promise.resolve(false);
+    const d = next.decision,
+      old = room.decision;
+    if (JSON.stringify(d) !== JSON.stringify(old)) {
+      if (!d?.mode) return run("reset_decision");
+      if (d.mode !== old?.mode) return run("mode", { value: d.mode });
+      if (d.candidate !== old?.candidate)
+        return run(d.candidate ? "nominate" : "reject", {
+          value: d.candidate,
+          version: old?.version,
+        });
+      return run("consent", { version: old?.version });
+    } else if (JSON.stringify(next.roles) !== JSON.stringify(room.roles))
+      return run("roles", { roles: next.roles });
+    else if (next.members.length < room.members.length)
+      return run("kick", {
+        memberId: room.members.find(
+          (m) => !next.members.some((x) => x.id === m.id),
+        )?.id,
+      });
+    const m = next.members.find((m) => m.isMe),
+      oldMe = room.members.find((m) => m.isMe);
+    if (
+      m?.preferences &&
+      (JSON.stringify(m.preferences) !== JSON.stringify(oldMe?.preferences) ||
+        m.submitted !== oldMe?.submitted)
+    )
+      return run("preferences", { preferences: m.preferences });
+    return Promise.resolve(true);
+  };
+  const changeAssignments: React.Dispatch<
+    React.SetStateAction<Assignment[]>
+  > = (value) => {
+    const next = typeof value === "function" ? value(assignments) : value;
+    const completed = next.find(
+      (a) =>
+        a.status === "done" &&
+        assignments.find((x) => x.id === a.id)?.status !== "done",
+    );
+    const reminded = next.find(
+      (a) =>
+        a.remindedAt !== assignments.find((x) => x.id === a.id)?.remindedAt,
+    );
+    if (completed) void run("complete", { roleId: completed.roleId });
+    else if (reminded) void run("remind", { roleId: reminded.roleId });
+  };
   const assign = () => {
-    if (!room) return;
-    setScreen("assigning");
-    setTimeout(() => {
-      const fair = calculateFairAssignment(
-          room.roles.map((role) => role.id),
-          room.members.map((m) => ({
-            memberId: m.id,
-            orderedRoles: m.preferences!,
-          })),
-        ),
-        list = fair.matches
-          .map((x) => {
-            const m = room.members.find((v) => v.id === x.memberId)!,
-              i = room.roles.findIndex((role) => role.id === x.role),
-              role = room.roles[i];
-            return {
-              ...m,
-              ...x,
-              roleId: role.id,
-              role: role.name,
-              deadline: role.deadline,
-              status: (i === 0 ? "active" : "waiting") as Assignment["status"],
-            };
-          })
-          .sort(
-            (a, b) =>
-              room.roles.findIndex((role) => role.id === a.roleId) -
-              room.roles.findIndex((role) => role.id === b.roleId),
-          );
-      setResult(fair);
-      setAssignments(list);
-      setScreen("results");
-    }, 1300);
+    void run("assign");
   };
   const copy = (s: string) => {
     navigator.clipboard?.writeText(s).catch(() => {});
@@ -530,7 +608,8 @@ export function App() {
           </button>
         )}
       </header>
-      <section className="page">
+      <section className="page" aria-busy={busy}>
+        {busy && <p role="status">저장 중…</p>}
         {screen === "home" && (
           <Home
             records={records}
@@ -565,14 +644,14 @@ export function App() {
               setAssignments(
                 joinedRecord?.assignments ?? records[r.id]?.assignments ?? [],
               );
-              setScreen("lobby");
+              setScreen(joinedRecord?.screen ?? "lobby");
             }}
           />
         )}{" "}
         {screen === "lobby" && room && (
           <Lobby
             room={room}
-            setRoom={setRoom}
+            setRoom={changeRoom}
             assign={assign}
             editing={editing}
             setEditing={setEditing}
@@ -583,26 +662,17 @@ export function App() {
             }
             copy={copy}
             leave={() => {
-              if (!room) return;
-              const remaining = room.members
-                .filter((m) => !m.isMe)
-                .map((m, i) => ({ ...m, isCreator: i === 0 }));
-              if (!remaining.length) {
-                const next = { ...records };
-                delete next[room.id];
-                setRecords(next);
-                localStorage.setItem(
-                  "carry-store",
-                  JSON.stringify({
-                    version: 2,
-                    rooms: next,
-                    currentRoomId: null,
-                  }),
-                );
+              void run("leave").then((ok) => {
+                if (!ok) return;
+                setRecords((previous) => {
+                  const next = { ...previous };
+                  delete next[room.id];
+                  return next;
+                });
                 setRoom(null);
                 setCurrentRoomId(null);
-              } else setRoom({ ...room, members: remaining, hidden: true });
-              setScreen("home");
+                setScreen("home");
+              });
             }}
           />
         )}{" "}
@@ -613,14 +683,12 @@ export function App() {
             result={result}
             assignments={assignments}
             accept={() => {
-              setAssignments((a) =>
-                a.map((x) => (x.isMe ? { ...x, accepted: true } : x)),
-              );
+              void run("accept");
             }}
-            acceptDemo={() =>
-              setAssignments((a) => a.map((x) => ({ ...x, accepted: true })))
-            }
-            start={() => setScreen("progress")}
+            acceptDemo={() => {}}
+            start={() => {
+              void run("start");
+            }}
             retry={() => setConfirm("retry")}
           />
         )}{" "}
@@ -628,11 +696,10 @@ export function App() {
           <Progress
             room={room}
             assignments={assignments}
-            setAssignments={setAssignments}
+            setAssignments={changeAssignments}
             home={home}
-            finish={(completedAt) => {
-              setRoom({ ...room, completedAt });
-              setScreen("complete");
+            finish={() => {
+              void run("finish");
             }}
           />
         )}
@@ -640,7 +707,17 @@ export function App() {
           <Completed
             room={room}
             home={home}
-            hide={() => setRoom({ ...room, hidden: true })}
+            hide={() => {
+              const hidden = JSON.parse(
+                localStorage.getItem("carry-hidden") || "{}",
+              );
+              localStorage.setItem(
+                "carry-hidden",
+                JSON.stringify({ ...hidden, [room.id]: true }),
+              );
+              setRoom({ ...room, hidden: true });
+              setScreen("home");
+            }}
           />
         )}
       </section>
@@ -689,7 +766,15 @@ function Home({
   open: (id: string) => void;
 }) {
   const visible = Object.values(records)
-      .filter((r) => !r.room.hidden)
+      .filter((r) => {
+        try {
+          return !JSON.parse(localStorage.getItem("carry-hidden") || "{}")[
+            r.room.id
+          ];
+        } catch {
+          return true;
+        }
+      })
       .sort((a, b) => b.lastAccessedAt.localeCompare(a.lastAccessedAt)),
     activeRecords = visible.filter((r) => !r.room.completedAt),
     completed = visible.filter((r) => r.room.completedAt).slice(0, 3);
@@ -1054,8 +1139,8 @@ function Join({
     const stored = Object.values(records).find(
       (record) => record.room.code === c,
     );
-    const target = stored?.room ?? (c === "CARRY1" ? MOCK_ROOM : null);
-    if (target?.id === MOCK_ROOM.id) {
+    const target = stored?.room ?? (DEV && c === "CARRY1" ? MOCK_ROOM : null);
+    if (DEV && target?.id === MOCK_ROOM.id) {
       if (target.members.some((m) => m.name === name.trim()))
         return fail("name", "이미 사용 중인 이름이에요.", nameRef);
       return done({
@@ -1227,7 +1312,7 @@ function Lobby({
   leave,
 }: {
   room: Room;
-  setRoom: (r: Room) => void;
+  setRoom: (r: Room) => Promise<boolean>;
   assign: () => void;
   editing: boolean;
   setEditing: (v: boolean) => void;
@@ -1437,52 +1522,25 @@ function Lobby({
               </button>
             )}
           </div>
-          <div className="preference-list">
-            {order.map((role, i) => (
-              <div
-                className="preference"
-                draggable
-                onDragStart={() => setDrag(i)}
-                onDragOver={(e) => e.preventDefault()}
-                onDrop={() => {
-                  if (drag === null || drag === i) return;
-                  const a = [...order],
-                    v = a.splice(drag, 1)[0];
-                  a.splice(i, 0, v);
-                  setOrder(a);
-                  setDrag(null);
-                }}
-                key={role}
-              >
-                <button
-                  className="drag-handle"
-                  aria-label={`${room.roles.find((item) => item.id === role)?.name ?? "역할"} ${i + 1}지망. 방향키로 이동`}
-                  onKeyDown={(e) => {
-                    if (e.key === "ArrowUp") {
-                      e.preventDefault();
-                      move(i, -1);
-                    }
-                    if (e.key === "ArrowDown") {
-                      e.preventDefault();
-                      move(i, 1);
-                    }
-                  }}
-                >
-                  <GripVertical size={19} />
-                </button>
+          <SortableList
+            items={order}
+            onChange={setOrder}
+            label={(id, i) =>
+              `${room.roles.find((r) => r.id === id)?.name} ${i + 1}지망. 드래그 또는 위아래 방향키로 이동`
+            }
+            render={(id, i) => (
+              <>
                 <strong>{i + 1}지망</strong>
-                <span>{room.roles.find((item) => item.id === role)?.name}</span>
+                <span>{room.roles.find((r) => r.id === id)?.name}</span>
                 <small>
-                  {room.roles.find((item) => item.id === role)?.deliverable}
+                  {room.roles.find((r) => r.id === id)?.deliverable}
                   <br />
                   개인 마감 ·{" "}
-                  {formatDate(
-                    room.roles.find((item) => item.id === role)!.deadline,
-                  )}
+                  {formatDate(room.roles.find((r) => r.id === id)!.deadline)}
                 </small>
-              </div>
-            ))}
-          </div>
+              </>
+            )}
+          />
           <button
             className={`button ${me?.submitted ? "secondary" : "primary"} full`}
             onClick={() =>
@@ -1576,12 +1634,26 @@ function LeaderDecision({
   setRoom,
 }: {
   room: Room;
-  setRoom: (r: Room) => void;
+  setRoom: (r: Room) => Promise<boolean>;
 }) {
-  const [mode, setMode] = useState<"known" | "random" | null>(null),
-    [candidate, setCandidate] = useState<string | null>(null),
-    [consents, setConsents] = useState<string[]>([]),
-    [notice, setNotice] = useState(""),
+  const mode = room.decision?.mode ?? null;
+  const candidate = room.decision?.candidate ?? null;
+  const consents = room.decision?.consents ?? [];
+  const me = room.members.find((m) => m.isMe);
+  const setMode = (mode: "known" | "random" | null) =>
+    setRoom({ ...room, decision: mode ? { mode, consents: [] } : undefined });
+  const setCandidate = (candidate: string | null) =>
+    setRoom({
+      ...room,
+      decision: {
+        ...room.decision,
+        candidate: candidate ?? undefined,
+        consents: [],
+      },
+    });
+  const setConsents = (consents: string[]) =>
+    setRoom({ ...room, decision: { ...room.decision, consents } });
+  const [notice, setNotice] = useState(""),
     [changeMode, setChangeMode] = useState(false),
     [cancelCandidate, setCancelCandidate] = useState(false);
   const appoint = (id: string) =>
@@ -1594,7 +1666,10 @@ function LeaderDecision({
     <section className="decision-box">
       <p className="eyebrow">팀장 결정</p>
       <h2>팀장은 어떻게 정할까요?</h2>
-      {!mode && (
+      {!mode && !me?.isCreator && (
+        <p>방 개설자가 팀장 결정 방식을 선택하고 있어요.</p>
+      )}
+      {!mode && me?.isCreator && (
         <div className="choice-grid">
           <button className="button secondary" onClick={() => setMode("known")}>
             이미 정해졌어요
@@ -1611,7 +1686,11 @@ function LeaderDecision({
               <p>방 개설자가 팀장 후보를 선택해주세요.</p>
               <div className="candidate-grid">
                 {room.members.map((m) => (
-                  <button key={m.id} onClick={() => setCandidate(m.id)}>
+                  <button
+                    key={m.id}
+                    disabled={!me?.isCreator}
+                    onClick={() => setCandidate(m.id)}
+                  >
                     {m.name}
                     {m.isCreator && <small>방 개설자</small>}
                   </button>
@@ -1621,29 +1700,50 @@ function LeaderDecision({
           ) : (
             <div className="nomination">
               <strong>{`‘${room.members.find((m) => m.id === candidate)?.name}’ 팀원이 팀장으로 지목됐어요.`}</strong>
-              <p>역할과 마감을 설정하는 팀장을 맡을까요?</p>
+              <p>이 팀장을 수락하시겠습니까? 모두 동의하면 확정됩니다.</p>
+              <div className="consent-list">
+                {room.members.map((m) => (
+                  <span key={m.id}>
+                    {m.name}
+                    <em>{consents.includes(m.id) ? "동의" : "대기 중"}</em>
+                  </span>
+                ))}
+              </div>
               {notice && <p className="error">{notice}</p>}
-              {(DEV || room.members.find((m) => m.id === candidate)?.isMe) && (
+              {me && !consents.includes(me.id) && (
                 <div>
                   <button
                     className="button secondary"
                     onClick={() => {
                       setCandidate(null);
-                      setNotice("후보가 거절했어요. 다시 선택해주세요.");
+                      setNotice("");
                     }}
                   >
                     거절
                   </button>
                   <button
                     className="button primary"
-                    onClick={() => appoint(candidate)}
+                    onClick={() => {
+                      const next = [...consents, me.id];
+                      if (next.length === room.members.length)
+                        setRoom({
+                          ...room,
+                          decision: { ...room.decision, consents: next },
+                          leaderId: candidate,
+                          members: room.members.map((m) => ({
+                            ...m,
+                            isHost: m.id === candidate,
+                          })),
+                        });
+                      else setConsents(next);
+                    }}
                   >
                     수락
                   </button>
                 </div>
               )}
-              {!DEV && !room.members.find((m) => m.id === candidate)?.isMe && (
-                <p>후보의 응답을 기다리고 있어요.</p>
+              {me && consents.includes(me.id) && (
+                <p>동의했어요. 다른 팀원의 응답을 기다리고 있어요.</p>
               )}
               {DEV && !room.members.find((m) => m.id === candidate)?.isMe && (
                 <small>
@@ -1692,21 +1792,15 @@ function LeaderDecision({
             </button>
           )}
           {DEV && <small>개발·데모용</small>}
-          <button
-            className="button primary full"
-            disabled={consents.length !== room.members.length}
-            onClick={() =>
-              appoint(
-                room.members[Math.floor(Math.random() * room.members.length)]
-                  .id,
-              )
-            }
-          >
-            랜덤으로 팀장 정하기
-          </button>
-          <button className="leave-button" onClick={() => setChangeMode(true)}>
-            팀장 결정 방식 변경
-          </button>
+          <p>모두 동의하면 자동으로 팀장이 정해져요.</p>
+          {me?.isCreator && (
+            <button
+              className="leave-button"
+              onClick={() => setChangeMode(true)}
+            >
+              팀장 결정 방식 변경
+            </button>
+          )}
         </div>
       )}
       {changeMode && (
@@ -1716,7 +1810,6 @@ function LeaderDecision({
           action="방식 변경"
           cancel={() => setChangeMode(false)}
           proceed={() => {
-            setConsents([]);
             setMode(null);
             setChangeMode(false);
           }}
@@ -1744,7 +1837,7 @@ function RoleSetup({
   onDone,
 }: {
   room: Room;
-  setRoom: (r: Room) => void;
+  setRoom: (r: Room) => Promise<boolean>;
   editing: boolean;
   onDone: () => void;
 }) {
@@ -1801,7 +1894,7 @@ function RoleSetup({
         {DEV && <small>개발·데모용</small>}
       </section>
     );
-  const save = () => {
+  const save = async () => {
     const fail = (
       index: number,
       field: "name" | "deliverable" | "deadline",
@@ -1865,7 +1958,7 @@ function RoleSetup({
       deadline: new Date(role.deadline).toISOString(),
     }));
     const changed = JSON.stringify(roles) !== JSON.stringify(original);
-    setRoom({
+    const saved = await setRoom({
       ...room,
       roles,
       members: changed
@@ -1876,7 +1969,7 @@ function RoleSetup({
           }))
         : room.members,
     });
-    onDone();
+    if (saved) onDone();
   };
   return (
     <section className="role-setup">
@@ -2091,11 +2184,13 @@ function Results({
             가상 팀원 수락 처리
           </button>
         )}
-        {allAccepted && (
-          <button className="button primary" onClick={start}>
-            팀 진행 시작
-          </button>
-        )}
+        {allAccepted &&
+          room.members.find((m) => m.isMe)?.isHost &&
+          !room.startedAt && (
+            <button className="button primary" onClick={start}>
+              팀 진행 시작
+            </button>
+          )}
         {room.members.find((m) => m.isMe)?.isHost && !allAccepted && (
           <button
             className="button secondary"
@@ -2112,6 +2207,11 @@ function Results({
           </button>
         )}
       </div>
+      {allAccepted && !room.members.find((m) => m.isMe)?.isHost && (
+        <p className="host-note">
+          모두 수락했어요. 팀장이 진행을 시작하면 자동으로 넘어가요.
+        </p>
+      )}
       {someAccepted &&
         !allAccepted &&
         room.members.find((m) => m.isMe)?.isHost && (

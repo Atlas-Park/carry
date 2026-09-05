@@ -1479,3 +1479,28 @@ select:focus {
     width: 100%;
   }
 }
+.sortable-card.is-dragging {
+  opacity: 0.22;
+}
+.sortable-overlay {
+  box-shadow: 0 16px 40px #0003;
+  cursor: grabbing;
+  background: white;
+}
+.drag-handle {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  min-width: 44px;
+  min-height: 44px;
+  cursor: grab;
+}
+.drag-handle:active {
+  cursor: grabbing;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sortable-card {
+    transition: none !important;
+  }
+}

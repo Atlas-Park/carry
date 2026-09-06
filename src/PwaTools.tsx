@@ -16,7 +16,7 @@ export const inviteCode = () => {
     new URLSearchParams(location.search).get("room")?.toUpperCase() ?? "";
   return /^[A-Z0-9]{6}$/.test(code) ? code : "";
 };
-export function PwaTools({ code }: { code?: string }) {
+export function PwaTools({ code, home }: { code?: string; home: boolean }) {
   const [install, setInstall] = useState<InstallEvent | null>(null);
   const [installed, setInstalled] = useState(
     matchMedia("(display-mode: standalone)").matches,
@@ -73,10 +73,11 @@ export function PwaTools({ code }: { code?: string }) {
     await navigator.clipboard.writeText(text);
     setMessage("복사했어요.");
   };
+  if (!home && !code) return null;
   return (
     <aside className="pwa-tools">
       <div className="pwa-actions">
-        {!installed && (
+        {home && !installed && (
           <button
             type="button"
             disabled={busy}
@@ -93,7 +94,7 @@ export function PwaTools({ code }: { code?: string }) {
               })
             }
           >
-            홈 화면에 설치
+            홈 화면에 추가하기 ↗
           </button>
         )}
         {code && (
@@ -123,102 +124,113 @@ export function PwaTools({ code }: { code?: string }) {
           </button>
         )}
       </div>
-      <details>
-        <summary>내 방 지키기 · 복구</summary>
-        <p>
-          브라우저 데이터 삭제·휴대폰 변경에 대비해 복구 키를 따로 저장해주세요.
-          초대 코드만으로는 내 신원을 복구할 수 없어요.
-        </p>
-        <p>
-          복구 키는 비밀번호와 같아요. 팀원에게 공유하지 마세요. 재발급하면 이전
-          키는 사용할 수 없어요.
-        </p>
-        <button
-          disabled={busy}
-          onClick={() => {
-            if (
-              window.confirm(
-                "새 복구 키를 발급할까요? 이전에 저장한 키가 있다면 더 이상 사용할 수 없어요.",
-              )
-            )
-              void task(async () => {
-                setIssued(await rpc("carry_issue_recovery_key"));
-                setMessage(
-                  "복구 키를 안전한 곳에 저장해주세요. 새로고침하면 다시 표시되지 않아요.",
-                );
-              });
-          }}
-        >
-          복구 키 발급 / 재발급
-        </button>
-        {issued && (
-          <div>
-            <textarea aria-label="발급된 복구 키" readOnly value={issued} />
-            <button onClick={() => void task(() => copy(issued))}>
-              키 복사
+      {home && (
+        <details className="pwa-help">
+          <summary>접속에 도움이 필요하세요?</summary>
+          <p>
+            기존 팀원에게 재입장 링크를 요청하세요. 팀원은 방 안의 ‘팀원 재입장
+            돕기’에서 링크를 만들 수 있어요.
+          </p>
+          <details>
+            <summary>1인 과제 · 이전 복구 키 사용</summary>
+            <p>
+              브라우저 데이터 삭제·휴대폰 변경에 대비해 복구 키를 따로
+              저장해주세요. 초대 코드만으로는 내 신원을 복구할 수 없어요.
+            </p>
+            <p>
+              복구 키는 비밀번호와 같아요. 팀원에게 공유하지 마세요. 재발급하면
+              이전 키는 사용할 수 없어요.
+            </p>
+            <button
+              disabled={busy}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "새 복구 키를 발급할까요? 이전에 저장한 키가 있다면 더 이상 사용할 수 없어요.",
+                  )
+                )
+                  void task(async () => {
+                    setIssued(await rpc("carry_issue_recovery_key"));
+                    setMessage(
+                      "복구 키를 안전한 곳에 저장해주세요. 새로고침하면 다시 표시되지 않아요.",
+                    );
+                  });
+              }}
+            >
+              복구 키 발급 / 재발급
             </button>
-          </div>
-        )}
-        <label>
-          저장해둔 복구 키
-          <input
-            type="password"
-            autoComplete="off"
-            value={key}
-            onChange={(e) => setKey(e.target.value)}
-            placeholder="복구 키 붙여넣기"
-          />
-        </label>
-        <button
-          disabled={busy || !key.trim()}
-          onClick={() =>
-            void task(async () => {
-              await rpc("carry_recover", { p_key: key.trim().toLowerCase() });
-              setKey("");
-              window.dispatchEvent(new Event("carry-refresh"));
-              setMessage("본인 확인 완료. 내 방 목록을 다시 불러와요.");
-            })
-          }
-        >
-          내 방 복구
-        </button>
-        <button
-          disabled={busy}
-          onClick={() =>
-            void task(async () => {
-              const rooms = (await rpc("carry_my_rooms")) as LeftRoom[];
-              setLeft(rooms.filter((r) => r.left && r.canRestore));
-              setMessage(
-                rooms.some((r) => r.left && r.canRestore)
-                  ? "참가가 마감되지 않은 방에 다시 들어갈 수 있어요."
-                  : "다시 참여할 수 있는 나간 방이 없어요.",
-              );
-            })
-          }
-        >
-          나간 방 찾기
-        </button>
-        {left.map((r) => (
-          <div key={r.roomId}>
-            <span>{r.record.room.name}</span>
+            {issued && (
+              <div>
+                <textarea aria-label="발급된 복구 키" readOnly value={issued} />
+                <button onClick={() => void task(() => copy(issued))}>
+                  키 복사
+                </button>
+              </div>
+            )}
+            <label>
+              저장해둔 복구 키
+              <input
+                type="password"
+                autoComplete="off"
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                placeholder="복구 키 붙여넣기"
+              />
+            </label>
+            <button
+              disabled={busy || !key.trim()}
+              onClick={() =>
+                void task(async () => {
+                  await rpc("carry_recover", {
+                    p_key: key.trim().toLowerCase(),
+                  });
+                  setKey("");
+                  window.dispatchEvent(new Event("carry-refresh"));
+                  setMessage("본인 확인 완료. 내 방 목록을 다시 불러와요.");
+                })
+              }
+            >
+              내 방 복구
+            </button>
             <button
               disabled={busy}
               onClick={() =>
                 void task(async () => {
-                  await rpc("carry_restore_room", { p_room_id: r.roomId });
-                  setLeft((previous) =>
-                    previous.filter((x) => x.roomId !== r.roomId),
+                  const rooms = (await rpc("carry_my_rooms")) as LeftRoom[];
+                  setLeft(rooms.filter((r) => r.left && r.canRestore));
+                  setMessage(
+                    rooms.some((r) => r.left && r.canRestore)
+                      ? "참가가 마감되지 않은 방에 다시 들어갈 수 있어요."
+                      : "다시 참여할 수 있는 나간 방이 없어요.",
                   );
-                  window.dispatchEvent(new Event("carry-refresh"));
-                  setMessage("내 방 목록에 복원했어요.");
                 })
               }
             >
-              다시 참여
+              나간 방 찾기
             </button>
-          </div>
-        ))}
-      </details>
+            {left.map((r) => (
+              <div key={r.roomId}>
+                <span>{r.record.room.name}</span>
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    void task(async () => {
+                      await rpc("carry_restore_room", { p_room_id: r.roomId });
+                      setLeft((previous) =>
+                        previous.filter((x) => x.roomId !== r.roomId),
+                      );
+                      window.dispatchEvent(new Event("carry-refresh"));
+                      setMessage("내 방 목록에 복원했어요.");
+                    })
+                  }
+                >
+                  다시 참여
+                </button>
+              </div>
+            ))}
+          </details>
+        </details>
+      )}
       {message && <p role="status">{message}</p>}
     </aside>
   );

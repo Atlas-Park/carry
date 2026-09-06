@@ -1,5 +1,14 @@
 # Carry PWA and recovery
 
+## Team-assisted reentry (primary flow)
+
+- In a room, open “팀원 재입장 돕기”. The leader can issue a link for another active member; another active member can issue one for the leader. Before leader selection, the creator acts as leader for this purpose.
+- Links expire in 30 minutes, are single-use, and become invalid when a newer link is issued for the same member. Only token hashes are stored. The secret is in the URL fragment rather than the request URL; the recipient screen removes it from the address bar.
+- Recipient checks their displayed name and confirms reentry. This is an acknowledgement, NOT independent proof of identity. Send only in a private conversation with the intended teammate. The product deliberately trusts teammates rather than requiring multiple approvals.
+- Only that room's membership owner changes; member ID, assigned role and progress remain unchanged. Prior identity loses access to that room, not other rooms. A browser already belonging to another member in the room cannot claim the link.
+- Recent reentries are recorded in the room. The legacy key flow remains nested under home help for solo projects and previously issued keys, not as a primary action.
+- `supabase/tests/reentry.sql` validates this flow inside a rollback transaction without persistent test data.
+
 - PWA: manifest, generated 192/512 icons, Apple touch icon, standalone display and browser install guidance. Push is intentionally absent.
 - Service worker caches only public offline fallback/icons. Room operations require a network connection; offline is not a room-editing mode.
 - Invite links use `?room=CODE`. Opening a link does not automatically join or grant existing-member privileges.

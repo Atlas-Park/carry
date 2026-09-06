@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { SortableList } from "./SortableList";
 import { PwaTools, inviteCode } from "./PwaTools";
+import { ReentryGate, ReentryMenu } from "./Reentry";
 import {
   ArrowDown,
   ArrowLeft,
@@ -66,6 +67,7 @@ export type Member = {
   accepted?: boolean;
 };
 export type Room = {
+  reentries?: { memberId: string; name: string; at: string }[];
   id: string;
   name: string;
   deadline: string;
@@ -321,6 +323,17 @@ const shuffled = <T,>(items: T[]) => {
 };
 export function App() {
   const applyingRemote = useRef(false);
+  const [reentryToken, setReentryToken] = useState(
+    () => new URLSearchParams(location.hash.slice(1)).get("reenter") ?? "",
+  );
+  useEffect(() => {
+    if (reentryToken)
+      history.replaceState(
+        history.state,
+        "",
+        location.pathname + location.search,
+      );
+  }, [reentryToken]);
   const [connection, setConnection] = useState(
     isSupabaseConfigured ? "내 방을 확인하고 있어요…" : "",
   );
@@ -630,6 +643,25 @@ export function App() {
     setToast("복사했어요");
     setTimeout(() => setToast(""), 1500);
   };
+  if (reentryToken)
+    return (
+      <ReentryGate
+        token={reentryToken}
+        cancel={() => setReentryToken("")}
+        done={(record, memberId) => {
+          rememberViewer(record.room.id, memberId);
+          const next = hydrateViewer(record);
+          setRecords((previous) => ({ ...previous, [record.room.id]: record }));
+          setRoom(next.room);
+          setResult(next.result);
+          setAssignments(next.assignments);
+          setCurrentRoomId(next.room.id);
+          setScreen(next.screen);
+          setReentryToken("");
+          window.dispatchEvent(new Event("carry-refresh"));
+        }}
+      />
+    );
   return (
     <main className="app-shell">
       <div className="ambient ambient-one" />
@@ -655,13 +687,6 @@ export function App() {
             </button>
           </p>
         )}
-        <PwaTools
-          code={
-            room && !["home", "create", "join"].includes(screen)
-              ? room.code
-              : undefined
-          }
-        />
         {busy && <p role="status">저장 중…</p>}
         {screen === "home" && (
           <Home
@@ -788,6 +813,17 @@ export function App() {
             }}
           />
         )}
+        {room && !["home", "create", "join"].includes(screen) && (
+          <ReentryMenu key={room.id} room={room} />
+        )}
+        <PwaTools
+          home={screen === "home"}
+          code={
+            room && !["home", "create", "join"].includes(screen)
+              ? room.code
+              : undefined
+          }
+        />
       </section>
       {confirm === "retry" && (
         <Confirm

@@ -1,0 +1,46 @@
+-- Run after the migration inside BEGIN/ROLLBACK; no QA data is retained.
+do $test$
+declare a uuid:=gen_random_uuid(); b uuid:=gen_random_uuid(); c uuid:=gen_random_uuid(); d uuid:=gen_random_uuid(); e uuid:=gen_random_uuid();
+ room jsonb; other_room jsonb; joined jsonb; rid uuid; aid uuid; bid uuid; cid uuid; token text; old_token text; result jsonb; denied boolean;
+begin
+ insert into auth.users(id) values(a),(b),(c),(d),(e);
+ perform set_config('request.jwt.claim.sub',a::text,true);
+ room:=create_room('[QA] reentry',now()+interval '10 days',3::smallint,'Leader','010-0000-0000',null,null);
+ rid:=(room->>'room_id')::uuid;aid:=(room->>'member_id')::uuid;
+ other_room:=create_room('[QA] untouched',now()+interval '10 days',2::smallint,'Leader','010-0000-0000',null,null);
+ perform set_config('request.jwt.claim.sub',b::text,true);
+ joined:=join_room(room->>'invite_code','Member','010-0000-0001',null,null);bid:=(joined->>'member_id')::uuid;
+ perform set_config('request.jwt.claim.sub',c::text,true);
+ joined:=join_room(room->>'invite_code','Peer','010-0000-0002',null,null);cid:=(joined->>'member_id')::uuid;
+ update room_snapshots set state=jsonb_set(state,'{room,leaderId}',to_jsonb(aid::text)) where room_id=rid;
+ update room_members set is_leader=true where id=aid;
+ denied:=false;begin perform carry_issue_reentry(rid,bid);exception when others then denied:=true;end;
+ if not denied then raise exception 'FAIL ordinary member issuance';end if;
+ token:=carry_issue_reentry(rid,aid); old_token:=token;token:=carry_issue_reentry(rid,aid);
+ denied:=false;begin perform carry_preview_reentry(old_token);exception when others then denied:=true;end;
+ if not denied then raise exception 'FAIL rotation';end if;
+ perform set_config('request.jwt.claim.sub',d::text,true);
+ denied:=false;begin perform carry_issue_reentry(rid,bid);exception when others then denied:=true;end;
+ if not denied then raise exception 'FAIL outsider issuance';end if;
+ denied:=false;begin perform carry_redeem_reentry(token,false);exception when others then denied:=true;end;
+ if not denied then raise exception 'FAIL unchecked redemption';end if;
+ result:=carry_redeem_reentry(token,true);
+ if result->>'member_id'<>aid::text or not is_room_leader(rid) then raise exception 'FAIL leader restoration';end if;
+ denied:=false;begin perform carry_redeem_reentry(token,true);exception when others then denied:=true;end;
+ if not denied then raise exception 'FAIL replay';end if;
+ token:=carry_issue_reentry(rid,bid);
+ denied:=false;begin perform carry_redeem_reentry(token,true);exception when others then denied:=true;end;
+ if not denied then raise exception 'FAIL existing-member takeover';end if;
+ perform set_config('request.jwt.claim.sub',e::text,true);
+ result:=carry_redeem_reentry(token,true);
+ if result->>'member_id'<>bid::text or is_room_leader(rid) then raise exception 'FAIL member restoration';end if;
+ perform set_config('request.jwt.claim.sub',a::text,true);
+ if is_room_member(rid) or not is_room_creator((other_room->>'room_id')::uuid) then raise exception 'FAIL room-scoped revocation';end if;
+ perform set_config('request.jwt.claim.sub',d::text,true);
+ token:=carry_issue_reentry(rid,cid);
+ update carry_reentry_links set expires_at=now()-interval '1 second' where token_hash=encode(sha256(convert_to(token,'UTF8')),'hex');
+ denied:=false;begin perform carry_redeem_reentry(token,true);exception when others then denied:=true;end;
+ if not denied then raise exception 'FAIL expiry';end if;
+ if has_table_privilege('authenticated','public.carry_reentry_links','SELECT') then raise exception 'FAIL token table exposure';end if;
+end $test$;
+select 'PASS: roles, rotation, outsider denial, confirmation, stable identity, replay, membership conflict, room scope, expiry' as result;

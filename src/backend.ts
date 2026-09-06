@@ -64,13 +64,7 @@ export async function createRemoteRoom(draft: Room): Promise<Room> {
     createdAt: remote.created_at ?? draft.createdAt,
     members: [{ ...creator, id: remote.member_id }],
   };
-  await saveRemoteRecord({
-    room,
-    result: null,
-    assignments: [],
-    screen: "lobby",
-    lastAccessedAt: new Date().toISOString(),
-  });
+  // The server creates membership and the initial snapshot atomically.
   return room;
 }
 
@@ -115,27 +109,17 @@ export async function saveRemoteRecord(record: RoomRecord) {
 
 export async function loadRemoteRecords() {
   if (!supabase) return [];
-  const session = await ensureAnonymousSession();
-  if (!session) return [];
-  const { data: memberships, error: membershipError } = await supabase
-    .from("room_members")
-    .select("id, room_id")
-    .eq("user_id", session.user.id);
-  if (membershipError) throw membershipError;
-  if (!memberships?.length) return [];
-  const memberByRoom = new Map(
-    memberships.map((m) => [m.room_id as string, m.id as string]),
-  );
-  const { data: snapshots, error } = await supabase
-    .from("room_snapshots")
-    .select("room_id, state, updated_at")
-    .in("room_id", [...memberByRoom.keys()]);
+  await ensureAnonymousSession();
+  const { data, error } = await supabase.rpc("carry_my_rooms");
   if (error) throw error;
-  return (snapshots ?? []).map((row) => ({
-    roomId: row.room_id as string,
-    memberId: memberByRoom.get(row.room_id as string)!,
-    record: row.state as RoomRecord,
-  }));
+  return (
+    (data ?? []) as {
+      roomId: string;
+      memberId: string;
+      record: RoomRecord;
+      left: boolean;
+    }[]
+  ).filter((row) => !row.left);
 }
 
 export function subscribeToRoomSnapshots(

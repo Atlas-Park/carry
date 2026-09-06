@@ -1,0 +1,41 @@
+-- Execute inside a transaction and ROLLBACK: no test rooms/users are retained.
+do $test$
+declare owner_id uuid:=gen_random_uuid(); alias_id uuid:=gen_random_uuid(); outsider_id uuid:=gen_random_uuid();
+ r jsonb; rid uuid; mid uuid; secret text; restored jsonb; denied boolean;
+begin
+ insert into auth.users(id) values(owner_id),(alias_id),(outsider_id);
+ perform set_config('request.jwt.claim.sub',owner_id::text,true);
+ r:=public.create_room('[QA] recovery transaction',now()+interval '10 days',2::smallint,'Tester','010-0000-0000',null,null);
+ rid:=(r->>'room_id')::uuid; mid:=(r->>'member_id')::uuid;
+ if not exists(select 1 from room_snapshots where room_id=rid) then raise exception 'FAIL atomic initialization'; end if;
+ secret:=public.carry_issue_recovery_key();
+ perform public.carry_command(rid,'leave');
+ if not exists(select 1 from rooms where id=rid) then raise exception 'FAIL last leave deleted room'; end if;
+ restored:=public.carry_restore_room(rid);
+ if (restored->>'member_id')::uuid<>mid then raise exception 'FAIL member changed'; end if;
+ perform set_config('request.jwt.claim.sub',alias_id::text,true);
+ denied:=false;
+ begin perform public.carry_recover(repeat('a',64)); exception when others then denied:=true; end;
+ if not denied then raise exception 'FAIL invalid key accepted'; end if;
+ perform public.carry_recover(secret);
+ if public.carry_owner()<>owner_id or not public.is_room_creator(rid) then raise exception 'FAIL recovery identity'; end if;
+ if jsonb_array_length(public.carry_my_rooms())<>1 then raise exception 'FAIL recovered room list'; end if;
+ restored:=public.join_room(r->>'invite_code','Same owner','010-0000-0000',null,null);
+ if (restored->>'member_id')::uuid<>mid then raise exception 'FAIL idempotent rejoin'; end if;
+ perform set_config('request.jwt.claim.sub',outsider_id::text,true);
+ denied:=false;
+ begin perform public.carry_command(rid,'leave'); exception when others then denied:=true; end;
+ if not denied then raise exception 'FAIL outsider command'; end if;
+ restored:=public.join_room(r->>'invite_code','Other','010-0000-0001',null,null);
+ if public.is_room_creator(rid) then raise exception 'FAIL invite granted creator'; end if;
+ perform set_config('request.jwt.claim.sub',owner_id::text,true);
+ perform public.carry_command(rid,'kick',jsonb_build_object('memberId',restored->>'member_id'));
+ perform set_config('request.jwt.claim.sub',outsider_id::text,true);
+ denied:=false;
+ begin perform public.carry_restore_room(rid); exception when others then denied:=true; end;
+ if not denied then raise exception 'FAIL kicked user restored'; end if;
+ if jsonb_array_length(public.carry_my_rooms())<>0 then raise exception 'FAIL kicked data exposure'; end if;
+ if (select count(*) from carry_room_history where room_id=rid)<4 then raise exception 'FAIL revision history'; end if;
+ if has_table_privilege('authenticated','public.carry_recovery_keys','SELECT') then raise exception 'FAIL recovery key exposure'; end if;
+end $test$;
+select 'PASS: atomic create, last leave, identity recovery, stable member ID, outsider denial, kick protection, history' as result;

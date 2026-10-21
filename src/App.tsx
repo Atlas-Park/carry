@@ -26,6 +26,13 @@ import {
   createRoleDeadlines,
   type FairAssignmentResult,
 } from "./assignment";
+import {
+  createDatabaseRoom,
+  hasDatabaseAccess,
+  joinDatabaseRoom,
+  loadDatabaseRoom,
+  saveDatabaseRoom,
+} from "./api";
 export type Screen =
   | "home"
   | "create"
@@ -307,6 +314,7 @@ const shuffled = <T,>(items: T[]) => {
 };
 export function App() {
   const applyingRemote = useRef(false);
+  const savedSignatures = useRef<Record<string, string>>({});
   const initial = useRef(loadStore()).current,
     rawInitialRecord = initial.currentRoomId
       ? initial.rooms[initial.currentRoomId]
@@ -327,6 +335,8 @@ export function App() {
     [confirm, setConfirm] = useState<"retry" | "roles" | null>(null),
     [editing, setEditing] = useState(false),
     [toast, setToast] = useState("");
+  const recordsRef = useRef(records);
+  recordsRef.current = records;
   // Browser back returns to the list, never to an obsolete workflow stage.
   const inDetail = screen !== "home";
   useEffect(() => {
@@ -403,6 +413,60 @@ export function App() {
     };
     window.addEventListener("storage", sync);
     return () => window.removeEventListener("storage", sync);
+  }, [currentRoomId]);
+  useEffect(() => {
+    if (!currentRoomId || !hasDatabaseAccess(currentRoomId)) return;
+    const record = records[currentRoomId];
+    if (!record) return;
+    const signature = JSON.stringify(record);
+    if (savedSignatures.current[currentRoomId] === signature) return;
+    const timer = window.setTimeout(() => {
+      void saveDatabaseRoom(record)
+        .then(() => {
+          savedSignatures.current[currentRoomId] = signature;
+        })
+        .catch((cause) =>
+          setToast(
+            cause instanceof Error
+              ? cause.message
+              : "변경사항을 저장하지 못했어요.",
+          ),
+        );
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [records, currentRoomId]);
+  useEffect(() => {
+    if (!currentRoomId || !hasDatabaseAccess(currentRoomId)) return;
+    let alive = true;
+    const refresh = async () => {
+      try {
+        const local = recordsRef.current[currentRoomId];
+        const saved = savedSignatures.current[currentRoomId];
+        if (local && (!saved || JSON.stringify(local) !== saved)) return;
+        const remote = await loadDatabaseRoom(currentRoomId);
+        if (!alive) return;
+        savedSignatures.current[currentRoomId] = JSON.stringify(remote);
+        setRecords((previous) => ({ ...previous, [currentRoomId]: remote }));
+        const next = hydrateViewer(remote);
+        applyingRemote.current = true;
+        setRoom(next.room);
+        setResult(next.result);
+        setAssignments(next.assignments);
+        setScreen(next.screen);
+      } catch {
+        // Keep the local cache usable during a temporary network outage.
+      }
+    };
+    const timer = window.setInterval(refresh, 3000);
+    const visible = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    document.addEventListener("visibilitychange", visible);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", visible);
+    };
   }, [currentRoomId]);
   const openRecord = (id: string) => {
     const stored = records[id];
@@ -515,21 +579,23 @@ export function App() {
         {screen === "create" && (
           <Create
             usedCodes={new Set(Object.values(records).map((r) => r.room.code))}
-            done={(r) => {
-              const viewer = r.members.find((member) => member.isMe);
-              if (viewer) rememberViewer(r.id, viewer.id);
+            done={async (r) => {
+              const viewer = r.members.find((member) => member.isMe)!;
+              const saved = await createDatabaseRoom({
+                room: r,
+                result: null,
+                assignments: [],
+                screen: "lobby",
+                lastAccessedAt: new Date().toISOString(),
+              });
+              rememberViewer(r.id, viewer.id);
+              const hydrated = hydrateViewer(saved);
               setRecords((previous) => ({
                 ...previous,
-                [r.id]: {
-                  room: r,
-                  result: null,
-                  assignments: [],
-                  screen: "lobby",
-                  lastAccessedAt: new Date().toISOString(),
-                },
+                [r.id]: saved,
               }));
               setCurrentRoomId(r.id);
-              setRoom(r);
+              setRoom(hydrated.room);
               setResult(null);
               setAssignments([]);
               setScreen("lobby");
@@ -538,7 +604,6 @@ export function App() {
         )}{" "}
         {screen === "join" && (
           <Join
-            records={records}
             done={(r, joinedRecord) => {
               const viewer = r.members.find((member) => member.isMe);
               if (viewer) rememberViewer(r.id, viewer.id);
@@ -803,7 +868,7 @@ function Create({
   done,
   usedCodes,
 }: {
-  done: (r: Room) => void;
+  done: (r: Room) => Promise<void>;
   usedCodes: Set<string>;
 }) {
   const f = new Date(Date.now() + 7 * 86400000);
@@ -817,13 +882,14 @@ function Create({
     [email, setEmail] = useState(""),
     [error, setError] = useState<{ field: string; message: string } | null>(
       null,
-    );
+    ),
+    [saving, setSaving] = useState(false);
   const nr = useRef<HTMLInputElement>(null),
     dr = useRef<HTMLInputElement>(null),
     cr = useRef<HTMLInputElement>(null),
     contactRef = useRef<HTMLInputElement>(null),
     emailRef = useRef<HTMLInputElement>(null);
-  const submit = (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const fail = (
       field: string,
@@ -880,7 +946,17 @@ function Create({
         },
       ],
     };
-    done(draft);
+    setSaving(true);
+    try {
+      await done(draft);
+    } catch (cause) {
+      setError({
+        field: "server",
+        message:
+          cause instanceof Error ? cause.message : "방을 만들지 못했어요.",
+      });
+      setSaving(false);
+    }
   };
   return (
     <div className="panel narrow">
@@ -1012,18 +1088,14 @@ function Create({
             {error.message}
           </p>
         )}
-        <button className="button primary full">방 만들기</button>
+        <button className="button primary full" disabled={saving}>
+          {saving ? "방 만드는 중…" : "방 만들기"}
+        </button>
       </form>
     </div>
   );
 }
-function Join({
-  done,
-  records,
-}: {
-  done: (r: Room, record?: RoomRecord) => void;
-  records: Record<string, RoomRecord>;
-}) {
+function Join({ done }: { done: (r: Room, record?: RoomRecord) => void }) {
   const [code, setCode] = useState(inviteCode),
     [name, setName] = useState(""),
     [phone, setPhone] = useState(""),
@@ -1031,12 +1103,13 @@ function Join({
     [email, setEmail] = useState(""),
     [error, setError] = useState<{ field: string; message: string } | null>(
       null,
-    );
+    ),
+    [joining, setJoining] = useState(false);
   const codeRef = useRef<HTMLInputElement>(null),
     nameRef = useRef<HTMLInputElement>(null),
     contactRef = useRef<HTMLInputElement>(null),
     emailRef = useRef<HTMLInputElement>(null);
-  const submit = (e: React.FormEvent) => {
+  const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const c = code.trim().toUpperCase();
     const fail = (
@@ -1063,43 +1136,39 @@ function Join({
       );
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
       return fail("email", "이메일 형식을 확인해주세요.", emailRef);
-    const stored = Object.values(records).find(
-        (record) => record.room.code === c,
-      ),
-      target = stored?.room ?? (DEV && c === "CARRY1" ? MOCK_ROOM : null);
-    if (!target) return fail("code", "유효하지 않은 초대 코드예요.", codeRef);
-    if (target.id !== MOCK_ROOM.id && target.roles.length > 0)
-      return fail(
-        "code",
-        "이미 역할 설정이 시작되어 참가할 수 없어요.",
-        codeRef,
-      );
-    if (target.id !== MOCK_ROOM.id && target.leaderId)
-      return fail(
-        "code",
-        "이미 팀장 결정이 시작되어 참가할 수 없어요.",
-        codeRef,
-      );
-    if (target.members.length >= target.size)
-      return fail("code", "이미 모든 팀원이 참가한 방이에요.", codeRef);
-    if (target.members.some((member) => member.name === name.trim()))
-      return fail("name", "이미 사용 중인 이름이에요.", nameRef);
-    done({
-      ...target,
-      members: [
-        ...target.members.map((member) => ({ ...member, isMe: false })),
+    const member: Member = {
+      id: crypto.randomUUID(),
+      name: name.trim(),
+      isMe: true,
+      contact: {
+        phone: phone.trim() || undefined,
+        kakao: kakao.trim() || undefined,
+        email: email.trim() || undefined,
+      },
+    };
+    if (DEV && c === "CARRY1")
+      return done({ ...MOCK_ROOM, members: [...MOCK_ROOM.members, member] });
+    setJoining(true);
+    try {
+      const joined = await joinDatabaseRoom(c, member);
+      done(
         {
-          id: crypto.randomUUID(),
-          name: name.trim(),
-          isMe: true,
-          contact: {
-            phone: phone.trim() || undefined,
-            kakao: kakao.trim() || undefined,
-            email: email.trim() || undefined,
-          },
+          ...joined.room,
+          members: joined.room.members.map((item) => ({
+            ...item,
+            isMe: item.id === member.id,
+          })),
         },
-      ],
-    });
+        joined,
+      );
+    } catch (cause) {
+      fail(
+        "code",
+        cause instanceof Error ? cause.message : "방에 참가하지 못했어요.",
+        codeRef,
+      );
+      setJoining(false);
+    }
   };
   return (
     <div className="panel narrow">
@@ -1211,7 +1280,9 @@ function Join({
             {error.message}
           </p>
         )}
-        <button className="button primary full">입장하기</button>
+        <button className="button primary full" disabled={joining}>
+          {joining ? "입장하는 중…" : "입장하기"}
+        </button>
       </form>
     </div>
   );

@@ -1,7 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { SortableList } from "./SortableList";
 import { PwaTools, inviteCode } from "./PwaTools";
-import { ReentryGate, ReentryMenu } from "./Reentry";
 import {
   ArrowDown,
   ArrowLeft,
@@ -27,18 +26,6 @@ import {
   createRoleDeadlines,
   type FairAssignmentResult,
 } from "./assignment";
-import {
-  createRemoteRoom,
-  roomCommand,
-  joinRemoteRoom,
-  loadRemoteRecords,
-  subscribeToRoomSnapshots,
-} from "./backend";
-import {
-  ensureAnonymousSession,
-  isSupabaseConfigured,
-  supabase,
-} from "./supabase";
 export type Screen =
   | "home"
   | "create"
@@ -67,7 +54,6 @@ export type Member = {
   accepted?: boolean;
 };
 export type Room = {
-  reentries?: { memberId: string; name: string; at: string }[];
   id: string;
   name: string;
   deadline: string;
@@ -88,7 +74,6 @@ export type Room = {
   };
 };
 export type RoomRecord = {
-  revision?: number;
   room: Room;
   result: FairAssignmentResult | null;
   assignments: Assignment[];
@@ -143,7 +128,7 @@ const MOCK_ROOM: Room = {
   members: mockMembers,
 };
 const demoNames = ["민지", "서준", "지우", "하린", "도윤", "수아"];
-const DEV = false;
+const DEV = import.meta.env.DEV;
 const emptyStore = (): CarryStore => ({
   version: 2,
   rooms: {},
@@ -202,7 +187,6 @@ const migrateRecord = (raw: any): RoomRecord | null => {
   });
   return {
     room,
-    revision: raw.revision ?? 0,
     result: raw.result ?? null,
     assignments,
     screen: raw.screen ?? "lobby",
@@ -323,30 +307,11 @@ const shuffled = <T,>(items: T[]) => {
 };
 export function App() {
   const applyingRemote = useRef(false);
-  const [reentryToken, setReentryToken] = useState(
-    () => new URLSearchParams(location.hash.slice(1)).get("reenter") ?? "",
-  );
-  useEffect(() => {
-    if (reentryToken)
-      history.replaceState(
-        history.state,
-        "",
-        location.pathname + location.search,
-      );
-  }, [reentryToken]);
-  const [connection, setConnection] = useState(
-    isSupabaseConfigured ? "내 방을 확인하고 있어요…" : "",
-  );
-  const revisions = useRef<Record<string, number>>({});
-  const currentRoomIdRef = useRef<string | null>(null);
   const initial = useRef(loadStore()).current,
     rawInitialRecord = initial.currentRoomId
       ? initial.rooms[initial.currentRoomId]
       : null,
-    initialRecord =
-      !isSupabaseConfigured && rawInitialRecord
-        ? hydrateViewer(rawInitialRecord)
-        : null;
+    initialRecord = rawInitialRecord ? hydrateViewer(rawInitialRecord) : null;
   const [screen, setScreen] = useState<Screen>(inviteCode() ? "join" : "home"),
     [records, setRecords] = useState<Record<string, RoomRecord>>(initial.rooms),
     [currentRoomId, setCurrentRoomId] = useState<string | null>(
@@ -362,106 +327,6 @@ export function App() {
     [confirm, setConfirm] = useState<"retry" | "roles" | null>(null),
     [editing, setEditing] = useState(false),
     [toast, setToast] = useState("");
-  useEffect(() => {
-    if (!isSupabaseConfigured) return;
-    let alive = true;
-    let channel: ReturnType<typeof subscribeToRoomSnapshots> = null;
-    const applyRemoteRecord = (roomId: string, rawRecord: RoomRecord) => {
-      const migrated = migrateRecord(rawRecord);
-      if (!migrated) return;
-      if ((migrated.revision ?? 0) < (revisions.current[roomId] ?? 0)) return;
-      revisions.current[roomId] = migrated.revision ?? 0;
-      setRecords((previous) => ({ ...previous, [roomId]: migrated }));
-      if (currentRoomIdRef.current === roomId) {
-        const next = hydrateViewer(migrated);
-        applyingRemote.current = true;
-        setRoom(next.room);
-        setResult(next.result);
-        setAssignments(next.assignments);
-        setScreen((current) =>
-          ["home", "create", "join"].includes(current) ? current : next.screen,
-        );
-      }
-    };
-    const onRemote = (event: Event) => {
-      const { id, record } = (
-        event as CustomEvent<{ id: string; record: RoomRecord | null }>
-      ).detail;
-      if (record) applyRemoteRecord(id, record);
-      else
-        setRecords((previous) => {
-          const next = { ...previous };
-          delete next[id];
-          return next;
-        });
-    };
-    window.addEventListener("carry-remote", onRemote);
-    let refreshing = false;
-    const refresh = async () => {
-      if (refreshing || !alive) return;
-      refreshing = true;
-      try {
-        await ensureAnonymousSession();
-        const remoteRooms = await loadRemoteRecords();
-        if (!alive) return;
-        setConnection("");
-        const loaded: Record<string, RoomRecord> = {};
-        for (const item of remoteRooms) {
-          rememberViewer(item.roomId, item.memberId);
-          const migrated = migrateRecord(item.record);
-          if (migrated) loaded[item.roomId] = migrated;
-        }
-        setRecords((previous) =>
-          Object.fromEntries(
-            Object.entries(loaded).map(([id, record]) => [
-              id,
-              (previous[id]?.revision ?? 0) > (record.revision ?? 0)
-                ? previous[id]
-                : record,
-            ]),
-          ),
-        );
-        const activeId = currentRoomIdRef.current;
-        if (activeId && loaded[activeId])
-          applyRemoteRecord(activeId, loaded[activeId]);
-        else if (activeId) {
-          setRoom(null);
-          setCurrentRoomId(null);
-          setScreen((current) =>
-            ["create", "join"].includes(current) ? current : "home",
-          );
-        }
-        if (!channel) channel = subscribeToRoomSnapshots(applyRemoteRecord);
-      } catch (error) {
-        console.error("Supabase startup failed", error);
-        setConnection(
-          error instanceof Error
-            ? error.message
-            : "연결을 확인해주세요. 이전 목록을 유지하고 있어요.",
-        );
-      } finally {
-        refreshing = false;
-      }
-    };
-    void refresh();
-    const onFocus = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
-    window.addEventListener("focus", onFocus);
-    window.addEventListener("carry-refresh", refresh);
-    const poll = setInterval(onFocus, 15000);
-    return () => {
-      alive = false;
-      clearInterval(poll);
-      window.removeEventListener("focus", onFocus);
-      window.removeEventListener("carry-refresh", refresh);
-      window.removeEventListener("carry-remote", onRemote);
-      if (channel && supabase) void supabase.removeChannel(channel);
-    };
-  }, []);
-  useEffect(() => {
-    currentRoomIdRef.current = currentRoomId;
-  }, [currentRoomId]);
   // Browser back returns to the list, never to an obsolete workflow stage.
   const inDetail = screen !== "home";
   useEffect(() => {
@@ -480,9 +345,10 @@ export function App() {
   };
   useEffect(() => {
     if (!room || !currentRoomId) return;
-    if (isSupabaseConfigured) return;
-    const skipRemoteSave = applyingRemote.current;
-    applyingRemote.current = false;
+    if (applyingRemote.current) {
+      applyingRemote.current = false;
+      return;
+    }
     setRecords((previousRooms) => {
       const previous = previousRooms[currentRoomId];
       const storedScreen: Screen = [
@@ -511,18 +377,6 @@ export function App() {
     });
   }, [room, result, assignments, screen, currentRoomId]);
   useEffect(() => {
-    if (!isSupabaseConfigured) return;
-    try {
-      localStorage.setItem(
-        "carry-store",
-        JSON.stringify({ version: 2, rooms: records, currentRoomId }),
-      );
-    } catch {
-      /* Server remains authoritative. */
-    }
-  }, [records, currentRoomId]);
-  useEffect(() => {
-    if (isSupabaseConfigured) return;
     const sync = (e: StorageEvent) => {
       if (e.key !== "carry-store" || !e.newValue) return;
       try {
@@ -566,102 +420,75 @@ export function App() {
           : record.screen,
     );
   };
-  const [busy, setBusy] = useState(false);
-  const busyRef = useRef(false);
-  const run = async (action: string, payload: Record<string, unknown> = {}) => {
-    if (!room || busyRef.current) return false;
-    busyRef.current = true;
-    setBusy(true);
-    setToast("");
-    try {
-      await roomCommand(room.id, action, payload);
-      return true;
-    } catch (e) {
-      setToast(
-        e instanceof Error
-          ? e.message
-          : "저장하지 못했어요. 다시 시도해주세요.",
-      );
-      return false;
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
-    }
-  };
   const changeRoom = (next: Room) => {
-    if (!room) return Promise.resolve(false);
-    const d = next.decision,
-      old = room.decision;
-    if (JSON.stringify(d) !== JSON.stringify(old)) {
-      if (!d?.mode) return run("reset_decision");
-      if (d.mode !== old?.mode) return run("mode", { value: d.mode });
-      if (d.candidate !== old?.candidate)
-        return run(d.candidate ? "nominate" : "reject", {
-          value: d.candidate,
-          version: old?.version,
-        });
-      return run("consent", { version: old?.version });
-    } else if (JSON.stringify(next.roles) !== JSON.stringify(room.roles))
-      return run("roles", { roles: next.roles });
-    else if (next.members.length < room.members.length)
-      return run("kick", {
-        memberId: room.members.find(
-          (m) => !next.members.some((x) => x.id === m.id),
-        )?.id,
-      });
-    const m = next.members.find((m) => m.isMe),
-      oldMe = room.members.find((m) => m.isMe);
     if (
-      m?.preferences &&
-      (JSON.stringify(m.preferences) !== JSON.stringify(oldMe?.preferences) ||
-        m.submitted !== oldMe?.submitted)
-    )
-      return run("preferences", { preferences: m.preferences });
+      !next.leaderId &&
+      next.decision?.mode === "random" &&
+      next.decision.consents?.length === next.members.length
+    ) {
+      const leader =
+        next.members[Math.floor(Math.random() * next.members.length)];
+      next = {
+        ...next,
+        leaderId: leader.id,
+        members: next.members.map((member) => ({
+          ...member,
+          isHost: member.id === leader.id,
+        })),
+      };
+    }
+    setRoom(next);
     return Promise.resolve(true);
   };
   const changeAssignments: React.Dispatch<
     React.SetStateAction<Assignment[]>
   > = (value) => {
-    const next = typeof value === "function" ? value(assignments) : value;
-    const completed = next.find(
-      (a) =>
-        a.status === "done" &&
-        assignments.find((x) => x.id === a.id)?.status !== "done",
-    );
-    const reminded = next.find(
-      (a) =>
-        a.remindedAt !== assignments.find((x) => x.id === a.id)?.remindedAt,
-    );
-    if (completed) void run("complete", { roleId: completed.roleId });
-    else if (reminded) void run("remind", { roleId: reminded.roleId });
+    setAssignments(value);
   };
   const assign = () => {
-    void run("assign");
+    if (!room) return;
+    setScreen("assigning");
+    setTimeout(() => {
+      const fair = calculateFairAssignment(
+          room.roles.map((role) => role.id),
+          room.members.map((member) => ({
+            memberId: member.id,
+            orderedRoles: member.preferences!,
+          })),
+        ),
+        list = fair.matches
+          .map((match) => {
+            const member = room.members.find(
+                (item) => item.id === match.memberId,
+              )!,
+              index = room.roles.findIndex((role) => role.id === match.role),
+              role = room.roles[index];
+            return {
+              ...member,
+              ...match,
+              roleId: role.id,
+              role: role.name,
+              deadline: role.deadline,
+              status: (index === 0
+                ? "active"
+                : "waiting") as Assignment["status"],
+            };
+          })
+          .sort(
+            (a, b) =>
+              room.roles.findIndex((role) => role.id === a.roleId) -
+              room.roles.findIndex((role) => role.id === b.roleId),
+          );
+      setResult(fair);
+      setAssignments(list);
+      setScreen("results");
+    }, 1300);
   };
   const copy = (s: string) => {
     navigator.clipboard?.writeText(s).catch(() => {});
     setToast("복사했어요");
     setTimeout(() => setToast(""), 1500);
   };
-  if (reentryToken)
-    return (
-      <ReentryGate
-        token={reentryToken}
-        cancel={() => setReentryToken("")}
-        done={(record, memberId) => {
-          rememberViewer(record.room.id, memberId);
-          const next = hydrateViewer(record);
-          setRecords((previous) => ({ ...previous, [record.room.id]: record }));
-          setRoom(next.room);
-          setResult(next.result);
-          setAssignments(next.assignments);
-          setCurrentRoomId(next.room.id);
-          setScreen(next.screen);
-          setReentryToken("");
-          window.dispatchEvent(new Event("carry-refresh"));
-        }}
-      />
-    );
   return (
     <main className="app-shell">
       <div className="ambient ambient-one" />
@@ -676,18 +503,7 @@ export function App() {
           </button>
         )}
       </header>
-      <section className="page" aria-busy={busy}>
-        {connection && (
-          <p role="status">
-            {connection}{" "}
-            <button
-              onClick={() => window.dispatchEvent(new Event("carry-refresh"))}
-            >
-              다시 확인
-            </button>
-          </p>
-        )}
-        {busy && <p role="status">저장 중…</p>}
+      <section className="page">
         {screen === "home" && (
           <Home
             records={records}
@@ -755,17 +571,30 @@ export function App() {
             }
             copy={copy}
             leave={() => {
-              void run("leave").then((ok) => {
-                if (!ok) return;
+              const remaining = room.members
+                .filter((member) => !member.isMe)
+                .map((member, index) => ({
+                  ...member,
+                  isCreator: index === 0,
+                }));
+              if (!remaining.length) {
                 setRecords((previous) => {
                   const next = { ...previous };
                   delete next[room.id];
+                  localStorage.setItem(
+                    "carry-store",
+                    JSON.stringify({
+                      version: 2,
+                      rooms: next,
+                      currentRoomId: null,
+                    }),
+                  );
                   return next;
                 });
                 setRoom(null);
-                setCurrentRoomId(null);
-                setScreen("home");
-              });
+              } else setRoom({ ...room, members: remaining, hidden: true });
+              setCurrentRoomId(null);
+              setScreen("home");
             }}
           />
         )}{" "}
@@ -776,11 +605,22 @@ export function App() {
             result={result}
             assignments={assignments}
             accept={() => {
-              void run("accept");
+              setAssignments((list) =>
+                list.map((assignment) =>
+                  assignment.isMe
+                    ? { ...assignment, accepted: true }
+                    : assignment,
+                ),
+              );
             }}
-            acceptDemo={() => {}}
+            acceptDemo={() =>
+              setAssignments((list) =>
+                list.map((assignment) => ({ ...assignment, accepted: true })),
+              )
+            }
             start={() => {
-              void run("start");
+              setRoom({ ...room, startedAt: new Date().toISOString() });
+              setScreen("progress");
             }}
             retry={() => setConfirm("retry")}
           />
@@ -791,8 +631,9 @@ export function App() {
             assignments={assignments}
             setAssignments={changeAssignments}
             home={home}
-            finish={() => {
-              void run("finish");
+            finish={(completedAt) => {
+              setRoom({ ...room, completedAt });
+              setScreen("complete");
             }}
           />
         )}
@@ -812,9 +653,6 @@ export function App() {
               setScreen("home");
             }}
           />
-        )}
-        {room && !["home", "create", "join"].includes(screen) && (
-          <ReentryMenu key={room.id} room={room} />
         )}
         <PwaTools
           home={screen === "home"}
@@ -977,7 +815,6 @@ function Create({
     [phone, setPhone] = useState(""),
     [kakao, setKakao] = useState(""),
     [email, setEmail] = useState(""),
-    [busy, setBusy] = useState(false),
     [error, setError] = useState<{ field: string; message: string } | null>(
       null,
     );
@@ -986,7 +823,7 @@ function Create({
     cr = useRef<HTMLInputElement>(null),
     contactRef = useRef<HTMLInputElement>(null),
     emailRef = useRef<HTMLInputElement>(null);
-  const submit = async (e: React.FormEvent) => {
+  const submit = (e: React.FormEvent) => {
     e.preventDefault();
     const fail = (
       field: string,
@@ -1043,18 +880,7 @@ function Create({
         },
       ],
     };
-    try {
-      setBusy(true);
-      done(await createRemoteRoom(draft));
-    } catch (cause) {
-      setError({
-        field: "server",
-        message:
-          cause instanceof Error ? cause.message : "방을 만들지 못했어요.",
-      });
-    } finally {
-      setBusy(false);
-    }
+    done(draft);
   };
   return (
     <div className="panel narrow">
@@ -1186,9 +1012,7 @@ function Create({
             {error.message}
           </p>
         )}
-        <button className="button primary full" disabled={busy}>
-          {busy ? "방을 만드는 중…" : "방 만들기"}
-        </button>
+        <button className="button primary full">방 만들기</button>
       </form>
     </div>
   );
@@ -1205,7 +1029,6 @@ function Join({
     [phone, setPhone] = useState(""),
     [kakao, setKakao] = useState(""),
     [email, setEmail] = useState(""),
-    [busy, setBusy] = useState(false),
     [error, setError] = useState<{ field: string; message: string } | null>(
       null,
     );
@@ -1213,7 +1036,7 @@ function Join({
     nameRef = useRef<HTMLInputElement>(null),
     contactRef = useRef<HTMLInputElement>(null),
     emailRef = useRef<HTMLInputElement>(null);
-  const submit = async (e: React.FormEvent) => {
+  const submit = (e: React.FormEvent) => {
     e.preventDefault();
     const c = code.trim().toUpperCase();
     const fail = (
@@ -1241,52 +1064,42 @@ function Join({
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
       return fail("email", "이메일 형식을 확인해주세요.", emailRef);
     const stored = Object.values(records).find(
-      (record) => record.room.code === c,
-    );
-    const target = stored?.room ?? (DEV && c === "CARRY1" ? MOCK_ROOM : null);
-    if (DEV && target?.id === MOCK_ROOM.id) {
-      if (target.members.some((m) => m.name === name.trim()))
-        return fail("name", "이미 사용 중인 이름이에요.", nameRef);
-      return done({
-        ...target,
-        members: [
-          ...target.members.map((member) => ({ ...member, isMe: false })),
-          {
-            id: crypto.randomUUID(),
-            name: name.trim(),
-            isMe: true,
-            contact: {
-              phone: phone || undefined,
-              kakao: kakao.trim() || undefined,
-              email: email || undefined,
-            },
-          },
-        ],
-      });
-    }
-    try {
-      setBusy(true);
-      const joined = await joinRemoteRoom({
-        code: c,
-        name: name.trim(),
-        phone: phone.trim() || undefined,
-        kakao: kakao.trim() || undefined,
-        email: email.trim() || undefined,
-      });
-      rememberViewer(joined.record.room.id, joined.memberId);
-      const migrated = migrateRecord(joined.record);
-      if (!migrated) throw new Error("방 데이터를 불러오지 못했어요.");
-      const hydrated = hydrateViewer(migrated);
-      done(hydrated.room, hydrated);
-    } catch (cause) {
-      fail(
+        (record) => record.room.code === c,
+      ),
+      target = stored?.room ?? (DEV && c === "CARRY1" ? MOCK_ROOM : null);
+    if (!target) return fail("code", "유효하지 않은 초대 코드예요.", codeRef);
+    if (target.id !== MOCK_ROOM.id && target.roles.length > 0)
+      return fail(
         "code",
-        cause instanceof Error ? cause.message : "방에 들어가지 못했어요.",
+        "이미 역할 설정이 시작되어 참가할 수 없어요.",
         codeRef,
       );
-    } finally {
-      setBusy(false);
-    }
+    if (target.id !== MOCK_ROOM.id && target.leaderId)
+      return fail(
+        "code",
+        "이미 팀장 결정이 시작되어 참가할 수 없어요.",
+        codeRef,
+      );
+    if (target.members.length >= target.size)
+      return fail("code", "이미 모든 팀원이 참가한 방이에요.", codeRef);
+    if (target.members.some((member) => member.name === name.trim()))
+      return fail("name", "이미 사용 중인 이름이에요.", nameRef);
+    done({
+      ...target,
+      members: [
+        ...target.members.map((member) => ({ ...member, isMe: false })),
+        {
+          id: crypto.randomUUID(),
+          name: name.trim(),
+          isMe: true,
+          contact: {
+            phone: phone.trim() || undefined,
+            kakao: kakao.trim() || undefined,
+            email: email.trim() || undefined,
+          },
+        },
+      ],
+    });
   };
   return (
     <div className="panel narrow">
@@ -1398,9 +1211,7 @@ function Join({
             {error.message}
           </p>
         )}
-        <button className="button primary full" disabled={busy}>
-          {busy ? "방을 찾는 중…" : "입장하기"}
-        </button>
+        <button className="button primary full">입장하기</button>
       </form>
     </div>
   );

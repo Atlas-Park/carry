@@ -312,6 +312,12 @@ const shuffled = <T,>(items: T[]) => {
   }
   return a;
 };
+const resumeScreen = (record: RoomRecord): Screen => {
+  if (record.room.completedAt) return "complete";
+  if (record.room.startedAt) return "progress";
+  if (record.assignments.length) return "results";
+  return "lobby";
+};
 export function App() {
   const applyingRemote = useRef(false);
   const savedSignatures = useRef<Record<string, string>>({});
@@ -320,7 +326,13 @@ export function App() {
       ? initial.rooms[initial.currentRoomId]
       : null,
     initialRecord = rawInitialRecord ? hydrateViewer(rawInitialRecord) : null;
-  const [screen, setScreen] = useState<Screen>(inviteCode() ? "join" : "home"),
+  const [screen, setScreen] = useState<Screen>(
+      inviteCode()
+        ? "join"
+        : initialRecord
+          ? resumeScreen(initialRecord)
+          : "home",
+    ),
     [records, setRecords] = useState<Record<string, RoomRecord>>(initial.rooms),
     [currentRoomId, setCurrentRoomId] = useState<string | null>(
       initial.currentRoomId,
@@ -345,14 +357,46 @@ export function App() {
     if (!inDetail && history.state?.carryDetail)
       history.replaceState(null, "", location.pathname);
   }, [inDetail]);
+  const leaveActiveRoom = (nextScreen: "home" | "create" | "join") => {
+    if (room && currentRoomId) {
+      const snapshot: RoomRecord = {
+        room,
+        result,
+        assignments,
+        screen: resumeScreen({
+          room,
+          result,
+          assignments,
+          screen,
+          lastAccessedAt: new Date().toISOString(),
+        }),
+        lastAccessedAt: new Date().toISOString(),
+      };
+      setRecords((previous) => {
+        const next = { ...previous, [currentRoomId]: snapshot };
+        localStorage.setItem(
+          "carry-store",
+          JSON.stringify({ version: 2, rooms: next, currentRoomId: null }),
+        );
+        return next;
+      });
+      if (hasDatabaseAccess(currentRoomId))
+        void saveDatabaseRoom(snapshot).catch(() => {});
+    }
+    setCurrentRoomId(null);
+    setRoom(null);
+    setResult(null);
+    setAssignments([]);
+    setEditing(false);
+    setConfirm(null);
+    setScreen(nextScreen);
+  };
+  const home = () => leaveActiveRoom("home");
   useEffect(() => {
-    const back = () => setScreen("home");
+    const back = () => home();
     window.addEventListener("popstate", back);
     return () => window.removeEventListener("popstate", back);
-  }, []);
-  const home = () => {
-    setScreen("home");
-  };
+  });
   useEffect(() => {
     if (!room || !currentRoomId) return;
     if (applyingRemote.current) {
@@ -476,31 +520,9 @@ export function App() {
     setRoom(record.room);
     setResult(record.result);
     setAssignments(record.assignments);
-    setScreen(
-      record.room.completedAt
-        ? "complete"
-        : !["lobby", "assigning", "results", "progress"].includes(record.screen)
-          ? "lobby"
-          : record.screen,
-    );
+    setScreen(resumeScreen(record));
   };
   const changeRoom = (next: Room) => {
-    if (
-      !next.leaderId &&
-      next.decision?.mode === "random" &&
-      next.decision.consents?.length === next.members.length
-    ) {
-      const leader =
-        next.members[Math.floor(Math.random() * next.members.length)];
-      next = {
-        ...next,
-        leaderId: leader.id,
-        members: next.members.map((member) => ({
-          ...member,
-          isHost: member.id === leader.id,
-        })),
-      };
-    }
     setRoom(next);
     return Promise.resolve(true);
   };
@@ -536,6 +558,7 @@ export function App() {
               status: (index === 0
                 ? "active"
                 : "waiting") as Assignment["status"],
+              accepted: true,
             };
           })
           .sort(
@@ -572,8 +595,8 @@ export function App() {
           <Home
             records={records}
             open={openRecord}
-            create={() => setScreen("create")}
-            join={() => setScreen("join")}
+            create={() => leaveActiveRoom("create")}
+            join={() => leaveActiveRoom("join")}
           />
         )}{" "}
         {screen === "create" && (
@@ -669,20 +692,6 @@ export function App() {
             room={room}
             result={result}
             assignments={assignments}
-            accept={() => {
-              setAssignments((list) =>
-                list.map((assignment) =>
-                  assignment.isMe
-                    ? { ...assignment, accepted: true }
-                    : assignment,
-                ),
-              );
-            }}
-            acceptDemo={() =>
-              setAssignments((list) =>
-                list.map((assignment) => ({ ...assignment, accepted: true })),
-              )
-            }
             start={() => {
               setRoom({ ...room, startedAt: new Date().toISOString() });
               setScreen("progress");
@@ -801,8 +810,6 @@ function Home({
       return me?.submitted
         ? "희망 순위 제출 완료 · 역할 배정 대기"
         : "희망 순위를 제출해주세요";
-    if (!assignments.every((a) => a.accepted))
-      return `${mine?.role ?? "배정된"} 역할 수락 대기`;
     if (done) return "최종 제출 확인 대기";
     return mine?.role ? `내 역할 · ${mine.role}` : `${active?.role} 진행 중`;
   };
@@ -1622,196 +1629,43 @@ function LeaderDecision({
   room: Room;
   setRoom: (r: Room) => Promise<boolean>;
 }) {
-  const mode = room.decision?.mode ?? null;
-  const candidate = room.decision?.candidate ?? null;
-  const consents = room.decision?.consents ?? [];
   const me = room.members.find((m) => m.isMe);
-  const setMode = (mode: "known" | "random" | null) =>
-    setRoom({ ...room, decision: mode ? { mode, consents: [] } : undefined });
-  const setCandidate = (candidate: string | null) =>
-    setRoom({
-      ...room,
-      decision: {
-        ...room.decision,
-        candidate: candidate ?? undefined,
-        consents: [],
-      },
-    });
-  const setConsents = (consents: string[]) =>
-    setRoom({ ...room, decision: { ...room.decision, consents } });
-  const [notice, setNotice] = useState(""),
-    [changeMode, setChangeMode] = useState(false),
-    [cancelCandidate, setCancelCandidate] = useState(false);
   const appoint = (id: string) =>
     setRoom({
       ...room,
+      decision: undefined,
       leaderId: id,
       members: room.members.map((m) => ({ ...m, isHost: m.id === id })),
     });
   return (
     <section className="decision-box">
       <p className="eyebrow">팀장 결정</p>
-      <h2>팀장은 어떻게 정할까요?</h2>
-      {!mode && !me?.isCreator && (
-        <p>방 개설자가 팀장 결정 방식을 선택하고 있어요.</p>
-      )}
-      {!mode && me?.isCreator && (
-        <div className="choice-grid">
-          <button className="button secondary" onClick={() => setMode("known")}>
-            이미 정해졌어요
-          </button>
-          <button className="button primary" onClick={() => setMode("random")}>
-            랜덤으로 정하기
-          </button>
-        </div>
-      )}
-      {mode === "known" && (
+      <h2>팀장을 선택해주세요</h2>
+      {!me?.isCreator ? (
+        <p>방 개설자가 팀장을 선택하고 있어요.</p>
+      ) : (
         <>
-          {!candidate ? (
-            <>
-              <p>방 개설자가 팀장 후보를 선택해주세요.</p>
-              <div className="candidate-grid">
-                {room.members.map((m) => (
-                  <button
-                    key={m.id}
-                    disabled={!me?.isCreator}
-                    onClick={() => setCandidate(m.id)}
-                  >
-                    {m.name}
-                    {m.isCreator && <small>방 개설자</small>}
-                  </button>
-                ))}
-              </div>
-            </>
-          ) : (
-            <div className="nomination">
-              <strong>{`‘${room.members.find((m) => m.id === candidate)?.name}’ 팀원이 팀장으로 지목됐어요.`}</strong>
-              <p>이 팀장을 수락하시겠습니까? 모두 동의하면 확정됩니다.</p>
-              <div className="consent-list">
-                {room.members.map((m) => (
-                  <span key={m.id}>
-                    {m.name}
-                    <em>{consents.includes(m.id) ? "동의" : "대기 중"}</em>
-                  </span>
-                ))}
-              </div>
-              {notice && <p className="error">{notice}</p>}
-              {me && !consents.includes(me.id) && (
-                <div>
-                  <button
-                    className="button secondary"
-                    onClick={() => {
-                      setCandidate(null);
-                      setNotice("");
-                    }}
-                  >
-                    거절
-                  </button>
-                  <button
-                    className="button primary"
-                    onClick={() => {
-                      const next = [...consents, me.id];
-                      if (next.length === room.members.length)
-                        setRoom({
-                          ...room,
-                          decision: { ...room.decision, consents: next },
-                          leaderId: candidate,
-                          members: room.members.map((m) => ({
-                            ...m,
-                            isHost: m.id === candidate,
-                          })),
-                        });
-                      else setConsents(next);
-                    }}
-                  >
-                    수락
-                  </button>
-                </div>
-              )}
-              {me && consents.includes(me.id) && (
-                <p>동의했어요. 다른 팀원의 응답을 기다리고 있어요.</p>
-              )}
-              {DEV && !room.members.find((m) => m.id === candidate)?.isMe && (
-                <small>
-                  가상 팀원의 응답을 대신 처리하는 개발·데모용 컨트롤
-                </small>
-              )}
-              {room.members.find((m) => m.isCreator)?.isMe && (
-                <button
-                  className="leave-button"
-                  onClick={() => setCancelCandidate(true)}
-                >
-                  후보 선택 취소
-                </button>
-              )}
-            </div>
-          )}
-        </>
-      )}
-      {mode === "random" && (
-        <div className="nomination">
-          <strong>팀장을 무작위로 정하는 데 동의하나요?</strong>
-          <div className="consent-list">
+          <p>선택 즉시 확정되며, 별도의 수락 과정은 없어요.</p>
+          <div className="candidate-grid">
             {room.members.map((m) => (
-              <span key={m.id}>
+              <button key={m.id} onClick={() => appoint(m.id)}>
                 {m.name}
-                <em>{consents.includes(m.id) ? "동의" : "대기 중"}</em>
-              </span>
+                {m.isCreator && <small>방 개설자</small>}
+              </button>
             ))}
           </div>
-          {!consents.includes(room.members.find((m) => m.isMe)?.id ?? "") && (
-            <button
-              className="button primary full"
-              onClick={() =>
-                setConsents([...consents, room.members.find((m) => m.isMe)!.id])
-              }
-            >
-              동의
-            </button>
-          )}
-          {DEV && (
-            <button
-              className="button secondary full"
-              onClick={() => setConsents(room.members.map((m) => m.id))}
-            >
-              가상 팀원 전원 동의
-            </button>
-          )}
-          {DEV && <small>개발·데모용</small>}
-          <p>모두 동의하면 자동으로 팀장이 정해져요.</p>
-          {me?.isCreator && (
-            <button
-              className="leave-button"
-              onClick={() => setChangeMode(true)}
-            >
-              팀장 결정 방식 변경
-            </button>
-          )}
-        </div>
-      )}
-      {changeMode && (
-        <Confirm
-          title="팀장 결정 방식을 변경할까요?"
-          body="현재까지 받은 랜덤 추첨 동의가 초기화됩니다."
-          action="방식 변경"
-          cancel={() => setChangeMode(false)}
-          proceed={() => {
-            setMode(null);
-            setChangeMode(false);
-          }}
-        />
-      )}
-      {cancelCandidate && (
-        <Confirm
-          title="팀장 후보 선택을 취소할까요?"
-          body="현재 후보 요청만 초기화되고 다른 팀원을 선택할 수 있어요."
-          action="선택 취소"
-          cancel={() => setCancelCandidate(false)}
-          proceed={() => {
-            setCandidate(null);
-            setCancelCandidate(false);
-          }}
-        />
+          <button
+            className="button secondary full"
+            onClick={() =>
+              appoint(
+                room.members[Math.floor(Math.random() * room.members.length)]
+                  .id,
+              )
+            }
+          >
+            무작위로 정하기
+          </button>
+        </>
       )}
     </section>
   );
@@ -2103,22 +1957,17 @@ function Results({
   room,
   result,
   assignments,
-  accept,
   retry,
-  acceptDemo,
   start,
 }: {
   room: Room;
   result: FairAssignmentResult;
   assignments: Assignment[];
-  accept: () => void;
   retry: () => void;
-  acceptDemo: () => void;
   start: () => void;
 }) {
   const first = assignments.filter((a) => a.rank === 1).length;
-  const someAccepted = assignments.some((a) => a.accepted),
-    allAccepted = assignments.every((a) => a.accepted);
+  const isHost = room.members.find((m) => m.isMe)?.isHost;
   return (
     <div className="panel">
       <Title
@@ -2155,56 +2004,28 @@ function Results({
                 {formatDate(a.deadline)}까지
               </div>
             </div>
-            <strong>{a.accepted ? "수락 완료" : "수락 대기"}</strong>
+            <strong>배정 완료</strong>
           </article>
         ))}
       </div>
       <div className="result-actions">
-        {!assignments.find((a) => a.isMe)?.accepted && (
-          <button className="button primary" onClick={accept}>
-            <Check size={18} />내 역할 수락
+        {isHost && !room.startedAt && (
+          <button className="button primary" onClick={start}>
+            팀 진행 시작
           </button>
         )}
-        {DEV && (
-          <button className="button secondary" onClick={acceptDemo}>
-            가상 팀원 수락 처리
-          </button>
-        )}
-        {allAccepted &&
-          room.members.find((m) => m.isMe)?.isHost &&
-          !room.startedAt && (
-            <button className="button primary" onClick={start}>
-              팀 진행 시작
-            </button>
-          )}
-        {room.members.find((m) => m.isMe)?.isHost && !allAccepted && (
-          <button
-            className="button secondary"
-            disabled={someAccepted}
-            onClick={retry}
-            title={
-              someAccepted
-                ? "역할 수락이 시작되어 다시 배정할 수 없어요."
-                : undefined
-            }
-          >
+        {isHost && (
+          <button className="button secondary" onClick={retry}>
             <RefreshCw size={17} />
             다시 배정
           </button>
         )}
       </div>
-      {allAccepted && !room.members.find((m) => m.isMe)?.isHost && (
+      {!isHost && (
         <p className="host-note">
-          모두 수락했어요. 팀장이 진행을 시작하면 자동으로 넘어가요.
+          역할이 확정됐어요. 팀장이 진행을 시작하면 자동으로 넘어가요.
         </p>
       )}
-      {someAccepted &&
-        !allAccepted &&
-        room.members.find((m) => m.isMe)?.isHost && (
-          <p className="host-note">
-            역할 수락이 시작되어 다시 배정할 수 없어요.
-          </p>
-        )}
     </div>
   );
 }
